@@ -1,0 +1,1366 @@
+# =============================================================================
+# Regional and Dog-Level Factors Associated With Shelter Stay Length and
+# Time to Adoption: Evidence From Public Animal Shelter Records in
+# Austin, Norfolk, and Louisville
+#
+# Converted from animal_shelter_group_project.Rmd to a plain R script for
+# running directly in Positron (no knitr/rmarkdown rendering required).
+# =============================================================================
+
+# -----------------------------------------------------------------------
+# 0. SETUP
+# -----------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(scales)
+  library(knitr)   # only used for kable() formatting of data frames
+  library(broom)
+  library(nnet)
+})
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 0, digits = 3)
+
+# ---- Locate this script's own folder ------------------------------------
+# No hardcoded paths: this finds the folder the .R file itself lives in,
+# so the script works for anyone as long as the three raw CSVs sit in the
+# SAME folder as this .R file. Works when sourced, run via Rscript, or run
+# interactively in Positron/RStudio.
+get_script_dir <- function() {
+  # Case 1: run non-interactively via `Rscript file.R` or `R -f file.R`
+  cmd_args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", cmd_args, value = TRUE)
+  if (length(file_arg) > 0) {
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]))))
+  }
+
+  # Case 2: running interactively in RStudio or Positron (this covers both
+  # sourcing the file and running it line-by-line/with "Run")
+  if (requireNamespace("rstudioapi", quietly = TRUE) &&
+      tryCatch(rstudioapi::isAvailable(), error = function(e) FALSE)) {
+    active_path <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(active_path)) {
+      return(dirname(normalizePath(active_path)))
+    }
+  }
+
+  # Fallback: current working directory (set this manually if detection fails)
+  getwd()
+}
+
+project_dir <- Sys.getenv("ANIMAL_SHELTER_PROJECT_DIR", unset = "")
+if (!nzchar(project_dir)) {
+  project_dir <- get_script_dir()
+}
+project_dir <- normalizePath(project_dir, mustWork = TRUE)
+
+# The three raw CSVs are expected directly in this folder (no data/raw subfolder needed).
+data_dir <- project_dir
+
+if (!dir.exists(data_dir)) {
+  stop(
+    "Could not determine the folder this script lives in. Set the ",
+    "ANIMAL_SHELTER_PROJECT_DIR environment variable to the folder ",
+    "containing the three CSV files, then re-run."
+  )
+}
+
+write_project_outputs <- !identical(Sys.getenv("WRITE_PROJECT_OUTPUTS"), "false")
+
+# Simple stand-in for the Rmd's research_table()/kable() wrapper.
+# Just prints a formatted table to the console (no LaTeX/HTML awareness needed).
+research_table <- function(x, ..., digits = getOption("digits"), caption = NULL,
+                            row.names = FALSE, label = NULL) {
+  if (!is.null(caption)) cat("\n---", caption, "---\n")
+  print(knitr::kable(x, format = "pipe", digits = digits, row.names = row.names, ...))
+  invisible(x)
+}
+
+kable <- research_table
+
+# -----------------------------------------------------------------------
+# 1. READ DATA
+# -----------------------------------------------------------------------
+
+find_one_csv <- function(dir, pattern) {
+  matches <- list.files(dir, pattern = pattern, ignore.case = TRUE, full.names = TRUE)
+  matches <- matches[!grepl("adopted_model_data\\.csv$", matches)]
+  if (length(matches) == 0) {
+    return(NA_character_)
+  }
+  # If multiple matches, prefer the most recently modified file.
+  if (length(matches) > 1) {
+    matches <- matches[order(file.info(matches)$mtime, decreasing = TRUE)]
+  }
+  matches[1]
+}
+
+austin_path    <- find_one_csv(data_dir, "^Austin.*Outcomes.*\\.csv$")
+virginia_path  <- find_one_csv(data_dir, "^Norfolk.*\\.csv$")
+kentucky_path  <- find_one_csv(data_dir, "^Animal_IO_Data.*\\.csv$")
+
+found_paths <- c(Austin = austin_path, Norfolk = virginia_path, Louisville = kentucky_path)
+missing_files <- names(found_paths)[is.na(found_paths)]
+if (length(missing_files) > 0) {
+  available_csvs <- list.files(data_dir, pattern = "\\.csv$", full.names = FALSE)
+  stop(
+    "Could not find a matching CSV for: ", paste(missing_files, collapse = ", "),
+    " in the script's folder (", data_dir, ").\n",
+    "CSV files actually present in that folder:\n  ",
+    if (length(available_csvs) > 0) paste(available_csvs, collapse = "\n  ") else "(none found)",
+    "\nMake sure the raw CSVs are unzipped and placed in the same folder as this .R file."
+  )
+}
+
+cat("\nUsing data files:\n",
+    "  Austin:     ", austin_path, "\n",
+    "  Norfolk:    ", virginia_path, "\n",
+    "  Louisville: ", kentucky_path, "\n\n")
+
+austin_raw <- readr::read_csv(
+  austin_path,
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+norfolk_raw <- readr::read_csv(
+  virginia_path,
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+louisville_raw <- readr::read_csv(
+  kentucky_path,
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+source_summary <- tibble(
+  region = c("Austin, TX", "Norfolk, VA", "Louisville, KY"),
+  raw_rows = c(nrow(austin_raw), nrow(norfolk_raw), nrow(louisville_raw)),
+  raw_columns = c(ncol(austin_raw), ncol(norfolk_raw), ncol(louisville_raw)),
+  age_information = c(
+    "Date of Birth",
+    "Years Old and Months Old",
+    "Not reported"
+  )
+)
+
+kable(source_summary, caption = "Raw dataset dimensions and age-field availability")
+
+# -----------------------------------------------------------------------
+# 2. HARMONIZATION HELPER FUNCTIONS
+# -----------------------------------------------------------------------
+
+parse_austin_datetime <- function(x) {
+  parse_date_time(
+    x,
+    orders = c(
+      "Y b d I:M:S p",
+      "Y B d I:M:S p",
+      "Y-m-d H:M:S",
+      "Y-m-d"
+    ),
+    quiet = TRUE
+  )
+}
+
+standardize_color <- function(color) {
+  color %>%
+    str_squish() %>%
+    str_to_title() %>%
+    str_replace_all("\\s*/\\s*", " / ") %>%
+    str_replace_all(regex("Grey", ignore_case = TRUE), "Gray") %>%
+    str_replace_all(regex("Tri[- ]?Color", ignore_case = TRUE), "Tricolor") %>%
+    str_replace_all(regex("Br Brindle", ignore_case = TRUE), "Brown Brindle") %>%
+    na_if("Unknown")
+}
+
+make_breed_family_simple <- function(breed) {
+  breed_lower <- str_to_lower(breed)
+
+  case_when(
+    str_detect(breed_lower, "pit bull|am pit|american staff|staffordshire") ~ "Pit Bull / Staffy",
+    str_detect(breed_lower, "labrador|lab retr|golden retr|retriever") ~ "Retriever",
+    str_detect(breed_lower, "shepherd|shepard") ~ "Shepherd",
+    str_detect(breed_lower, "chihuahua|shih tzu|yorkshire|poodle|maltese") ~ "Small Companion",
+    str_detect(breed_lower, "husky|boxer|rottweiler|doberman") ~ "Working / Large",
+    str_detect(breed_lower, "beagle|hound") ~ "Hound / Beagle",
+    TRUE ~ "Other"
+  )
+}
+
+make_color_family_simple <- function(color) {
+  color_lower <- str_to_lower(color)
+
+  case_when(
+    str_detect(color_lower, "black") ~ "Black",
+    str_detect(color_lower, "white") ~ "White",
+    str_detect(color_lower, "brown|chocolate") ~ "Brown",
+    str_detect(color_lower, "tan|fawn|buff|cream") ~ "Tan/Cream",
+    str_detect(color_lower, "gray|blue|silver") ~ "Gray/Blue",
+    str_detect(color_lower, "red|orange|yellow") ~ "Red/Orange",
+    str_detect(color_lower, "brindle|tricolor|tri") ~ "Patterned",
+    TRUE ~ "Other"
+  )
+}
+
+make_outcome_group <- function(outcome) {
+  outcome_lower <- str_to_lower(outcome)
+
+  case_when(
+    str_detect(outcome_lower, "adopt") ~ "Adoption",
+    str_detect(outcome_lower, "transfer|rescue") ~ "Transfer",
+    str_detect(outcome_lower, "\\brto\\b|return|reclaim|owner") ~ "Return to Owner",
+    str_detect(outcome_lower, "euth") ~ "Euthanasia",
+    str_detect(outcome_lower, "died|dead") ~ "Died",
+    TRUE ~ "Other"
+  )
+}
+
+make_age_group <- function(age_years) {
+  cut(
+    age_years,
+    breaks = c(-Inf, 0.5, 2, 7, Inf),
+    labels = c("Puppy (<6 months)", "Young (6 months-2 years)", "Adult (2-7 years)", "Senior (7+ years)")
+  )
+}
+
+most_common <- function(x) {
+  x <- x[!is.na(x)]
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted), na.rm = TRUE)
+}
+
+# -----------------------------------------------------------------------
+# 3. CLEAN EACH REGION
+# -----------------------------------------------------------------------
+
+austin_dogs <- austin_raw %>%
+  filter(Type == "Dog") %>%
+  mutate(
+    outcome_dt = parse_austin_datetime(`Outcome Date`),
+    intake_dt = parse_austin_datetime(`Intake Date`),
+    birth_dt = parse_austin_datetime(`Date of Birth`),
+    stay_days = as.numeric(difftime(outcome_dt, intake_dt, units = "days")),
+    age_years = as.numeric(difftime(outcome_dt, birth_dt, units = "days")) / 365.25,
+    age_years = if_else(age_years >= 0 & age_years <= 25, age_years, NA_real_),
+    outcome_group = make_outcome_group(`Outcome Status`),
+    fixed_status = case_when(
+      str_to_lower(`Spayed/Neutered`) == "yes" ~ "Spayed/Neutered",
+      str_to_lower(`Spayed/Neutered`) == "no" ~ "Not spayed/neutered",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  filter(!is.na(outcome_dt), !is.na(intake_dt), stay_days >= 0) %>%
+  transmute(
+    region = "Austin, TX",
+    intake_dt = as_date(intake_dt),
+    outcome_dt = as_date(outcome_dt),
+    stay_days,
+    age_years,
+    outcome_group,
+    adopted = outcome_group == "Adoption",
+    sex_group = case_when(
+      str_detect(str_to_lower(Sex), "female") ~ "Female",
+      str_detect(str_to_lower(Sex), "male") ~ "Male",
+      TRUE ~ "Unknown"
+    ),
+    fixed_status,
+    breed_family = make_breed_family_simple(`Primary Breed`),
+    color_family = make_color_family_simple(standardize_color(`Primary Color`))
+  )
+
+norfolk_dogs <- norfolk_raw %>%
+  filter(`Animal Type` == "Dog") %>%
+  mutate(
+    outcome_dt = mdy(`Outcome Date`, quiet = TRUE),
+    intake_dt = mdy(`Intake Date`, quiet = TRUE),
+    stay_days = as.numeric(difftime(outcome_dt, intake_dt, units = "days")),
+    years_old = as.numeric(`Years Old`),
+    months_old = as.numeric(`Months Old`),
+    age_years_raw = case_when(
+      !is.na(years_old) & years_old >= 0 & !is.na(months_old) & months_old >= 0 ~ years_old + months_old / 12,
+      !is.na(years_old) & years_old >= 0 ~ years_old,
+      !is.na(months_old) & months_old >= 0 ~ months_old / 12,
+      TRUE ~ NA_real_
+    ),
+    age_years = if_else(age_years_raw >= 0 & age_years_raw <= 25, age_years_raw, NA_real_),
+    outcome_group = make_outcome_group(`Outcome Type`),
+    sex_lower = str_to_lower(Sex),
+    sex_group = case_when(
+      str_detect(sex_lower, "female|spayed") ~ "Female",
+      str_detect(sex_lower, "male|neutered") ~ "Male",
+      TRUE ~ "Unknown"
+    ),
+    fixed_status = case_when(
+      str_detect(sex_lower, "spayed|neutered") ~ "Spayed/Neutered",
+      str_detect(sex_lower, "male|female") ~ "Not spayed/neutered",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  filter(!is.na(outcome_dt), !is.na(intake_dt), stay_days >= 0) %>%
+  transmute(
+    region = "Norfolk, VA",
+    intake_dt = as_date(intake_dt),
+    outcome_dt = as_date(outcome_dt),
+    stay_days,
+    age_years,
+    outcome_group,
+    adopted = outcome_group == "Adoption",
+    sex_group,
+    fixed_status,
+    breed_family = make_breed_family_simple(`Primary Breed`),
+    color_family = make_color_family_simple(standardize_color(`Primary Color`))
+  )
+
+louisville_dogs <- louisville_raw %>%
+  filter(animaltype == "DOG") %>%
+  mutate(
+    outcome_dt = as_date(outdate),
+    intake_dt = as_date(indate),
+    stay_days = as.numeric(difftime(outcome_dt, intake_dt, units = "days")),
+    outcome_group = make_outcome_group(outtype),
+    sex_group = case_when(
+      sex %in% c("F", "S") ~ "Female",
+      sex %in% c("M", "N") ~ "Male",
+      TRUE ~ "Unknown"
+    ),
+    fixed_status = case_when(
+      sex %in% c("S", "N") ~ "Spayed/Neutered",
+      sex %in% c("F", "M") ~ "Not spayed/neutered",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  filter(!is.na(outcome_dt), !is.na(intake_dt), stay_days >= 0) %>%
+  transmute(
+    region = "Louisville, KY",
+    intake_dt,
+    outcome_dt,
+    stay_days,
+    age_years = NA_real_,
+    outcome_group,
+    adopted = outcome_group == "Adoption",
+    sex_group,
+    fixed_status,
+    breed_family = make_breed_family_simple(breed),
+    color_family = make_color_family_simple(standardize_color(color))
+  )
+
+# -----------------------------------------------------------------------
+# 4. COMBINE, RESTRICT TO SHARED PERIOD, BUILD MODELING DATASETS
+# -----------------------------------------------------------------------
+
+all_dogs_all_periods <- bind_rows(austin_dogs, norfolk_dogs, louisville_dogs) %>%
+  mutate(
+    region = factor(region, levels = c("Austin, TX", "Norfolk, VA", "Louisville, KY")),
+    outcome_group = factor(outcome_group),
+    breed_family = factor(
+      breed_family,
+      levels = c("Other", "Pit Bull / Staffy", "Retriever", "Shepherd", "Small Companion", "Working / Large", "Hound / Beagle")
+    ),
+    color_family = factor(
+      color_family,
+      levels = c("Other", "Black", "White", "Brown", "Tan/Cream", "Gray/Blue", "Red/Orange", "Patterned")
+    )
+  )
+
+date_ranges <- all_dogs_all_periods %>%
+  group_by(region) %>%
+  summarize(
+    cleaned_dog_records = n(),
+    min_outcome_date = min(outcome_dt),
+    max_outcome_date = max(outcome_dt),
+    .groups = "drop"
+  )
+
+common_start <- max(date_ranges$min_outcome_date)
+common_end <- min(date_ranges$max_outcome_date)
+
+shared_period_all_outcomes <- all_dogs_all_periods %>%
+  filter(outcome_dt >= common_start, outcome_dt <= common_end) %>%
+  mutate(
+    log_stay = log1p(stay_days),
+    age_group = make_age_group(age_years),
+    intake_month = factor(as.character(month(intake_dt, label = TRUE, abbr = TRUE)), levels = month.abb),
+    sex_group = factor(sex_group, levels = c("Female", "Male", "Unknown")),
+    fixed_status = factor(fixed_status, levels = c("Not spayed/neutered", "Spayed/Neutered", "Unknown"))
+  ) %>%
+  drop_na(log_stay, intake_month, sex_group, fixed_status, breed_family, color_family)
+
+model_data <- shared_period_all_outcomes %>%
+  filter(adopted) %>%
+  droplevels()
+
+age_all_outcome_data <- shared_period_all_outcomes %>%
+  filter(region %in% c("Austin, TX", "Norfolk, VA"), !is.na(age_years), !is.na(age_group)) %>%
+  droplevels()
+
+adopted_model_data <- age_all_outcome_data %>%
+  filter(
+    adopted,
+    sex_group != "Unknown",
+    fixed_status != "Unknown"
+  ) %>%
+  droplevels()
+
+age_model_data <- adopted_model_data
+
+same_period_summary <- model_data %>%
+  group_by(region) %>%
+  summarize(
+    adopted_records = n(),
+    median_days_to_adoption = median(stay_days),
+    mean_days_to_adoption = mean(stay_days),
+    p75_days_to_adoption = quantile(stay_days, 0.75),
+    .groups = "drop"
+  )
+
+age_availability <- model_data %>%
+  group_by(region) %>%
+  summarize(
+    adopted_records = n(),
+    records_with_age = sum(!is.na(age_years)),
+    percent_with_age = percent(records_with_age / adopted_records, accuracy = 0.1),
+    .groups = "drop"
+  )
+
+shared_period_report <- same_period_summary %>%
+  left_join(
+    age_availability %>%
+      select(region, records_with_age, percent_with_age),
+    by = "region"
+  ) %>%
+  mutate(
+    shared_start = common_start,
+    shared_end = common_end
+  ) %>%
+  select(
+    region,
+    shared_start,
+    shared_end,
+    adopted_records,
+    records_with_age,
+    percent_with_age,
+    median_days_to_adoption,
+    mean_days_to_adoption,
+    p75_days_to_adoption
+  )
+
+kable(
+  shared_period_report,
+  digits = 2,
+  caption = "Shared-period adopted-dog sample by region"
+)
+
+cat("\nShared comparison window:", as.character(common_start), "through", as.character(common_end), "\n")
+cat("Adoption-timing model n =", nrow(adopted_model_data), "\n")
+
+# -----------------------------------------------------------------------
+# 5. DESCRIPTIVE RESULTS ACROSS REGIONS
+# -----------------------------------------------------------------------
+
+p_regional_stay <- ggplot(model_data, aes(x = region, y = stay_days, fill = region)) +
+  geom_boxplot(outlier.alpha = 0.15, show.legend = FALSE) +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Adoption stay length differs across regions",
+    subtitle = "Adopted dogs only; the y-axis is zoomed to 0-100 days so the main distribution is visible.",
+    x = "Region",
+    y = "Computed stay length in days"
+  )
+print(p_regional_stay)
+
+outcome_summary <- shared_period_all_outcomes %>%
+  count(region, outcome_group) %>%
+  group_by(region) %>%
+  mutate(region_percent = n / sum(n)) %>%
+  ungroup()
+
+region_totals <- shared_period_all_outcomes %>%
+  count(region, name = "total_dogs")
+
+adoption_summary <- outcome_summary %>%
+  filter(outcome_group == "Adoption") %>%
+  select(region, adoption_count = n) %>%
+  left_join(region_totals, by = "region") %>%
+  mutate(adoption_rate = adoption_count / total_dogs)
+
+p_outcome_mix <- ggplot(outcome_summary, aes(x = region, y = region_percent, fill = outcome_group)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Outcome mix is not identical across regions",
+    x = "Region",
+    y = "Percent of dogs",
+    fill = "Outcome group"
+  )
+print(p_outcome_mix)
+
+# -----------------------------------------------------------------------
+# 6. AGE-STRATIFIED RESULTS IN AUSTIN AND NORFOLK
+# -----------------------------------------------------------------------
+
+age_distribution_summary <- age_model_data %>%
+  group_by(region) %>%
+  summarize(
+    records = n(),
+    median_age_years = median(age_years),
+    mean_age_years = mean(age_years),
+    p25_age_years = quantile(age_years, 0.25),
+    p75_age_years = quantile(age_years, 0.75),
+    .groups = "drop"
+  )
+kable(age_distribution_summary, digits = 2, caption = "Age distribution summary of adopted dogs")
+
+p_age_dist <- ggplot(age_model_data, aes(x = age_years, fill = region)) +
+  geom_histogram(binwidth = 0.5, alpha = 0.75, color = "white") +
+  facet_wrap(~ region, ncol = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Age distribution of adopted dogs",
+    x = "Age in years",
+    y = "Number of dogs",
+    fill = "Region"
+  )
+print(p_age_dist)
+
+age_group_summary <- age_model_data %>%
+  group_by(region, age_group) %>%
+  summarize(
+    records = n(),
+    median_stay_days = median(stay_days),
+    mean_stay_days = mean(stay_days),
+    p75_stay_days = quantile(stay_days, 0.75),
+    .groups = "drop"
+  )
+
+p_age_group_stay <- ggplot(age_group_summary, aes(x = age_group, y = median_stay_days, fill = region)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Median time to adoption varies by age group",
+    x = "Age group",
+    y = "Median days to adoption",
+    fill = "Region"
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+print(p_age_group_stay)
+
+# ---- Cumulative adoption rate by age group and time interval ----------
+
+adoption_day_intervals <- c(10, 20, 30, 60, 90, 180)
+
+age_time_denominators <- age_all_outcome_data %>%
+  group_by(region, age_group) %>%
+  summarize(
+    all_age_known_records = n(),
+    adopted_records = sum(adopted),
+    .groups = "drop"
+  )
+
+cumulative_adoption_counts <- age_all_outcome_data %>%
+  filter(adopted) %>%
+  select(region, age_group, stay_days) %>%
+  uncount(weights = length(adoption_day_intervals), .id = "interval_id") %>%
+  mutate(day_threshold = adoption_day_intervals[interval_id]) %>%
+  filter(stay_days <= day_threshold) %>%
+  count(region, age_group, day_threshold, name = "adopted_by_day")
+
+cumulative_age_adoption <- expand_grid(
+  region = levels(age_all_outcome_data$region),
+  age_group = levels(age_all_outcome_data$age_group),
+  day_threshold = adoption_day_intervals
+) %>%
+  mutate(
+    region = factor(region, levels = levels(age_all_outcome_data$region)),
+    age_group = factor(age_group, levels = levels(age_all_outcome_data$age_group))
+  ) %>%
+  left_join(age_time_denominators, by = c("region", "age_group")) %>%
+  left_join(cumulative_adoption_counts, by = c("region", "age_group", "day_threshold")) %>%
+  mutate(
+    adopted_by_day = replace_na(adopted_by_day, 0L),
+    cumulative_adoption_probability = adopted_by_day / all_age_known_records,
+    conditional_adoption_speed = adopted_by_day / adopted_records
+  )
+
+cumulative_age_adoption_display <- cumulative_age_adoption %>%
+  filter(day_threshold %in% c(30, 90, 180)) %>%
+  transmute(
+    region,
+    age_group,
+    time_interval = paste0(day_threshold, " days"),
+    adopted_by_interval = adopted_by_day,
+    adoption_rate_among_all_age_known_dogs = percent(cumulative_adoption_probability, accuracy = 0.1),
+    adoption_speed_among_adopted_dogs = percent(conditional_adoption_speed, accuracy = 0.1)
+  )
+
+cumulative_plot_data <- cumulative_age_adoption %>%
+  select(region, age_group, day_threshold, cumulative_adoption_probability, conditional_adoption_speed) %>%
+  pivot_longer(
+    cols = c(cumulative_adoption_probability, conditional_adoption_speed),
+    names_to = "rate_definition",
+    values_to = "rate"
+  ) %>%
+  mutate(
+    rate_definition = recode(
+      rate_definition,
+      cumulative_adoption_probability = "All age-known dogs: adopted by this day",
+      conditional_adoption_speed = "Adopted dogs only: adoption happened by this day"
+    )
+  )
+
+p_cumulative_adoption <- ggplot(cumulative_plot_data, aes(x = day_threshold, y = rate, color = age_group)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_grid(rate_definition ~ region) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_x_continuous(breaks = adoption_day_intervals) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Cumulative adoption rates by age group and time interval",
+    subtitle = "The upper panels measure adoption probability; the lower panels measure adoption speed among dogs that were adopted.",
+    x = "Days after intake",
+    y = "Cumulative percentage",
+    color = "Age group"
+  )
+print(p_cumulative_adoption)
+
+kable(
+  cumulative_age_adoption_display,
+  caption = "Selected cumulative adoption rates by age group and time interval"
+)
+
+# -----------------------------------------------------------------------
+# 7. STRUCTURED TREATMENT OF QUALITATIVE PREDICTORS
+# -----------------------------------------------------------------------
+
+minimum_factor_count <- 50
+
+collapse_rare_factor <- function(x, min_n = minimum_factor_count) {
+  fct_lump_min(x, min = min_n, other_level = "Other") %>%
+    fct_relevel("Other")
+}
+
+age_model_data <- age_model_data %>%
+  mutate(
+    breed_family = collapse_rare_factor(breed_family),
+    color_family = collapse_rare_factor(color_family)
+  ) %>%
+  droplevels()
+
+filtered_model_data_path <- file.path(project_dir, "adopted_model_data.csv")
+
+if (write_project_outputs) {
+  age_model_data %>%
+    mutate(across(where(is.factor), as.character)) %>%
+    write_csv(filtered_model_data_path)
+
+  cat("\nWrote filtered modeling dataset to:", filtered_model_data_path, "\n")
+}
+
+# -----------------------------------------------------------------------
+# 8. MULTIVARIABLE REGRESSION RESULTS
+# -----------------------------------------------------------------------
+
+base_timing_lm <- lm(
+  log_stay ~ region + intake_month,
+  data = age_model_data
+)
+
+age_group_lm <- lm(
+  log_stay ~ region + intake_month + age_group,
+  data = age_model_data
+)
+
+sex_fixed_lm <- lm(
+  log_stay ~ region + intake_month + age_group + sex_group + fixed_status,
+  data = age_model_data
+)
+
+breed_lm <- lm(
+  log_stay ~ region + intake_month + age_group + sex_group + fixed_status + breed_family,
+  data = age_model_data
+)
+
+full_structured_lm <- lm(
+  log_stay ~ region + intake_month + age_group + sex_group + fixed_status + breed_family + color_family,
+  data = age_model_data
+)
+
+full_interaction_lm <- lm(
+  log_stay ~ region * age_group + intake_month + sex_group + fixed_status + breed_family + color_family,
+  data = age_model_data
+)
+
+age_control_lm <- full_interaction_lm
+
+evaluate_lm <- function(model, data, model_name) {
+  predicted_days <- pmax(0, expm1(predict(model, newdata = data)))
+  glance_row <- glance(model)
+  model_aic <- AIC(model)
+
+  tibble(
+    model_name = model_name,
+    r_squared = glance_row$r.squared,
+    adj_r_squared = glance_row$adj.r.squared,
+    aic = model_aic,
+    rmse_days = rmse(data$stay_days, predicted_days),
+    mae_days = mae(data$stay_days, predicted_days)
+  )
+}
+
+model_comparison <- bind_rows(
+  evaluate_lm(base_timing_lm, age_model_data, "1. Region + intake month"),
+  evaluate_lm(age_group_lm, age_model_data, "2. + age group"),
+  evaluate_lm(sex_fixed_lm, age_model_data, "3. + sex and spay/neuter"),
+  evaluate_lm(breed_lm, age_model_data, "4. + breed family"),
+  evaluate_lm(full_structured_lm, age_model_data, "5. + color family"),
+  evaluate_lm(full_interaction_lm, age_model_data, "6. + region x age group")
+)
+
+kable(model_comparison, digits = 3, caption = "Model comparison for adopted dogs in Austin and Norfolk")
+
+# ---- Nested model (block) tests ----------------------------------------
+
+block_test <- function(reduced_model, full_model, label) {
+  test_result <- anova(reduced_model, full_model)
+
+  tibble(
+    test = label,
+    added_df = test_result$Df[2],
+    added_sum_squares = test_result$`Sum of Sq`[2],
+    f_statistic = test_result$F[2],
+    p_value = test_result$`Pr(>F)`[2]
+  )
+}
+
+model_tests <- bind_rows(
+  block_test(base_timing_lm, age_group_lm, "Age group after region and intake month"),
+  block_test(age_group_lm, sex_fixed_lm, "Sex and spay/neuter after age"),
+  block_test(sex_fixed_lm, breed_lm, "Breed family after age and sex controls"),
+  block_test(breed_lm, full_structured_lm, "Color family after breed"),
+  block_test(full_structured_lm, full_interaction_lm, "Region-by-age-group interaction after all controls")
+) %>%
+  mutate(
+    p_value_formatted = if_else(
+      p_value < 0.001,
+      scientific(p_value, digits = 3),
+      as.character(round(p_value, 4))
+    ),
+    conclusion = if_else(
+      p_value < 0.05,
+      "Adds significant explanatory value",
+      "Does not add significant explanatory value"
+    )
+  )
+
+kable(model_tests, digits = 4, caption = "Block tests for structured qualitative factors")
+
+# ---- Adjusted predictions by region and age group ----------------------
+
+reference_values <- age_model_data %>%
+  summarize(
+    region = most_common(region),
+    age_group = most_common(age_group),
+    sex_group = most_common(sex_group),
+    fixed_status = most_common(fixed_status),
+    breed_family = most_common(breed_family),
+    color_family = most_common(color_family),
+    intake_month = most_common(intake_month)
+  )
+
+cast_model_factor_levels <- function(data) {
+  data %>%
+    mutate(
+      region = factor(region, levels = levels(age_model_data$region)),
+      age_group = factor(age_group, levels = levels(age_model_data$age_group)),
+      sex_group = factor(sex_group, levels = levels(age_model_data$sex_group)),
+      fixed_status = factor(fixed_status, levels = levels(age_model_data$fixed_status)),
+      breed_family = factor(breed_family, levels = levels(age_model_data$breed_family)),
+      color_family = factor(color_family, levels = levels(age_model_data$color_family)),
+      intake_month = factor(intake_month, levels = levels(age_model_data$intake_month))
+    )
+}
+
+age_prediction_grid <- expand_grid(
+  region = levels(age_model_data$region),
+  age_group = levels(age_model_data$age_group)
+) %>%
+  mutate(
+    sex_group = reference_values$sex_group,
+    fixed_status = reference_values$fixed_status,
+    breed_family = reference_values$breed_family,
+    color_family = reference_values$color_family,
+    intake_month = reference_values$intake_month
+  ) %>%
+  cast_model_factor_levels()
+
+age_group_predictions <- bind_cols(
+  age_prediction_grid,
+  as_tibble(predict(age_control_lm, newdata = age_prediction_grid, interval = "confidence"))
+) %>%
+  mutate(
+    predicted_stay_days = pmax(0, expm1(fit)),
+    lower_days = pmax(0, expm1(lwr)),
+    upper_days = pmax(0, expm1(upr))
+  )
+
+kable(
+  age_group_predictions %>%
+    select(region, age_group, predicted_stay_days, lower_days, upper_days),
+  digits = 2,
+  caption = "Model-adjusted predicted days to adoption by age group"
+)
+
+p_adjusted_age_group <- ggplot(age_group_predictions, aes(x = age_group, y = predicted_stay_days, color = region)) +
+  geom_pointrange(
+    aes(ymin = lower_days, ymax = upper_days),
+    position = position_dodge(width = 0.55),
+    linewidth = 0.7
+  ) +
+  geom_line(
+    aes(group = region),
+    position = position_dodge(width = 0.55),
+    linewidth = 0.55
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Regression model plot: region-specific adoption timing pattern",
+    subtitle = "The model allows the age-group pattern to differ between Austin and Norfolk.",
+    x = "Age group",
+    y = "Predicted days to adoption",
+    color = "Region"
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+print(p_adjusted_age_group)
+
+# ---- Adjusted predictions for sex, breed, and color ---------------------
+
+make_adjusted_factor_predictions <- function(variable_name, factor_label) {
+  variable_levels <- levels(age_model_data[[variable_name]])
+
+  new_data <- reference_values[rep(1, length(variable_levels)), ] %>%
+    mutate(
+      across(everything(), as.character)
+    )
+
+  new_data[[variable_name]] <- variable_levels
+  new_data <- cast_model_factor_levels(new_data)
+
+  bind_cols(
+    new_data,
+    as_tibble(predict(age_control_lm, newdata = new_data, interval = "confidence"))
+  ) %>%
+    mutate(
+      model_factor = factor_label,
+      factor_level = as.character(.data[[variable_name]]),
+      predicted_stay_days = pmax(0, expm1(fit)),
+      lower_days = pmax(0, expm1(lwr)),
+      upper_days = pmax(0, expm1(upr))
+    )
+}
+
+qualitative_factor_predictions <- bind_rows(
+  make_adjusted_factor_predictions("sex_group", "Sex"),
+  make_adjusted_factor_predictions("fixed_status", "Spay/neuter status"),
+  make_adjusted_factor_predictions("breed_family", "Breed family"),
+  make_adjusted_factor_predictions("color_family", "Color family")
+) %>%
+  filter(!is.na(factor_level)) %>%
+  mutate(factor_level = str_wrap(factor_level, width = 18))
+
+p_qualitative_factors <- ggplot(
+  qualitative_factor_predictions,
+  aes(x = fct_reorder(factor_level, predicted_stay_days), y = predicted_stay_days)
+) +
+  geom_segment(
+    aes(
+      xend = fct_reorder(factor_level, predicted_stay_days),
+      y = lower_days,
+      yend = upper_days
+    ),
+    color = "#4D4D4D",
+    linewidth = 0.7
+  ) +
+  geom_pointrange(
+    aes(ymin = lower_days, ymax = upper_days),
+    color = "#0072B2",
+    linewidth = 0.65,
+    size = 0.55
+  ) +
+  coord_flip() +
+  facet_wrap(~ model_factor, scales = "free_y", ncol = 2) +
+  scale_y_continuous(limits = c(0, NA), breaks = pretty_breaks(n = 5)) +
+  labs(
+    title = "Structured qualitative factors in the regression model",
+    subtitle = "Unknown sex and spay/neuter labels are excluded before modeling.",
+    x = "Factor level",
+    y = "Predicted days to adoption",
+    caption = "Points show adjusted predictions; horizontal intervals show 95% confidence intervals."
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    plot.caption = element_text(hjust = 0)
+  )
+print(p_qualitative_factors)
+
+# -----------------------------------------------------------------------
+# 9. ADOPTION PROFILE ANALYSIS
+# -----------------------------------------------------------------------
+
+minimum_profile_count <- 30
+
+profile_candidates <- age_model_data %>%
+  group_by(region, age_group, sex_group, fixed_status, breed_family, color_family) %>%
+  summarize(
+    similar_dogs = n(),
+    adoption_records = n(),
+    age_years = median(age_years),
+    intake_month = most_common(intake_month),
+    observed_median_days_to_adoption = median(stay_days),
+    .groups = "drop"
+  ) %>%
+  filter(similar_dogs >= minimum_profile_count) %>%
+  cast_model_factor_levels() %>%
+  drop_na(region, age_group, sex_group, fixed_status, breed_family, color_family, intake_month)
+
+profile_days_prediction <- as_tibble(
+  predict(age_control_lm, newdata = profile_candidates, interval = "confidence")
+)
+
+profile_predictions <- profile_candidates %>%
+  mutate(
+    predicted_days_to_adoption = pmax(0, expm1(profile_days_prediction$fit)),
+    lower_days_to_adoption = pmax(0, expm1(profile_days_prediction$lwr)),
+    upper_days_to_adoption = pmax(0, expm1(profile_days_prediction$upr))
+  ) %>%
+  arrange(predicted_days_to_adoption)
+
+top_adoption_profiles <- profile_predictions %>%
+  slice_head(n = 10) %>%
+  transmute(
+    region,
+    age_group,
+    sex_group,
+    fixed_status,
+    breed_family,
+    color_family,
+    similar_dogs,
+    adoption_records,
+    predicted_days_to_adoption = round(predicted_days_to_adoption, 1),
+    lower_days = round(lower_days_to_adoption, 1),
+    upper_days = round(upper_days_to_adoption, 1),
+    observed_median_days_to_adoption = round(observed_median_days_to_adoption, 1)
+  )
+
+kable(
+  top_adoption_profiles,
+  caption = "Top model-estimated adoption profiles among combinations with enough observed dogs"
+)
+
+# -----------------------------------------------------------------------
+# 10. SUPPLEMENTARY NEURAL NETWORK PREDICTION MODEL
+# -----------------------------------------------------------------------
+
+set.seed(20260705)
+
+nn_model_data <- age_model_data %>%
+  mutate(long_stay = stay_days > 30) %>%
+  select(
+    long_stay,
+    stay_days,
+    age_years,
+    region,
+    intake_month,
+    sex_group,
+    fixed_status,
+    breed_family,
+    color_family
+  ) %>%
+  drop_na() %>%
+  droplevels()
+
+prediction_formula <- long_stay ~ age_years + region + intake_month +
+  sex_group + fixed_status + breed_family + color_family
+
+prediction_terms <- delete.response(terms(prediction_formula))
+
+safe_divide <- function(numerator, denominator) {
+  if (is.na(denominator) || denominator == 0) {
+    return(NA_real_)
+  }
+
+  numerator / denominator
+}
+
+calculate_auc <- function(actual, probability) {
+  actual_numeric <- as.integer(actual)
+
+  if (length(unique(actual_numeric)) < 2) {
+    return(NA_real_)
+  }
+
+  ranks <- rank(probability, ties.method = "average")
+  n_positive <- sum(actual_numeric == 1)
+  n_negative <- sum(actual_numeric == 0)
+
+  (sum(ranks[actual_numeric == 1]) - n_positive * (n_positive + 1) / 2) /
+    (n_positive * n_negative)
+}
+
+calculate_classification_metrics <- function(actual, probability, model_name, seed) {
+  probability <- pmin(pmax(probability, 1e-6), 1 - 1e-6)
+  actual_numeric <- as.integer(actual)
+  actual_positive <- actual_numeric == 1
+  predicted_positive <- probability >= 0.5
+
+  true_positive <- sum(predicted_positive & actual_positive)
+  true_negative <- sum(!predicted_positive & !actual_positive)
+  false_positive <- sum(predicted_positive & !actual_positive)
+  false_negative <- sum(!predicted_positive & actual_positive)
+
+  tibble(
+    seed = seed,
+    model = model_name,
+    test_records = length(actual_numeric),
+    long_stay_rate = mean(actual_positive),
+    accuracy = mean(predicted_positive == actual_positive),
+    sensitivity = safe_divide(true_positive, true_positive + false_negative),
+    specificity = safe_divide(true_negative, true_negative + false_positive),
+    precision = safe_divide(true_positive, true_positive + false_positive),
+    auc = calculate_auc(actual_positive, probability),
+    log_loss = -mean(
+      actual_numeric * log(probability) +
+        (1 - actual_numeric) * log(1 - probability)
+    ),
+    brier_score = mean((probability - actual_numeric)^2)
+  )
+}
+
+build_design_matrix <- function(data) {
+  model.matrix(prediction_terms, data = data)[, -1, drop = FALSE]
+}
+
+align_design_matrix <- function(matrix_raw, reference_columns) {
+  matrix_raw <- as.matrix(matrix_raw)
+  missing_columns <- setdiff(reference_columns, colnames(matrix_raw))
+
+  if (length(missing_columns) > 0) {
+    missing_matrix <- matrix(
+      0,
+      nrow = nrow(matrix_raw),
+      ncol = length(missing_columns),
+      dimnames = list(NULL, missing_columns)
+    )
+    matrix_raw <- cbind(matrix_raw, missing_matrix)
+  }
+
+  matrix_raw[, reference_columns, drop = FALSE]
+}
+
+standardize_with_training <- function(matrix_raw, training_means, training_sds) {
+  sweep(
+    sweep(matrix_raw, 2, training_means, "-"),
+    2,
+    training_sds,
+    "/"
+  )
+}
+
+create_prediction_split <- function(data, seed, train_prop = 0.7) {
+  set.seed(seed)
+
+  train_ids <- data %>%
+    mutate(row_id = row_number()) %>%
+    group_by(long_stay) %>%
+    slice_sample(prop = train_prop) %>%
+    ungroup() %>%
+    pull(row_id)
+
+  list(
+    train = data %>% slice(train_ids),
+    test = data %>% slice(setdiff(seq_len(nrow(data)), train_ids))
+  )
+}
+
+fit_prediction_models <- function(seed) {
+  split_data <- create_prediction_split(nn_model_data, seed)
+  train_data <- split_data$train
+  test_data <- split_data$test
+
+  train_x_raw <- build_design_matrix(train_data)
+  test_x_raw <- align_design_matrix(
+    build_design_matrix(test_data),
+    colnames(train_x_raw)
+  )
+
+  training_means <- colMeans(train_x_raw)
+  training_sds <- apply(train_x_raw, 2, sd)
+  training_sds[is.na(training_sds) | training_sds == 0] <- 1
+
+  train_x <- standardize_with_training(train_x_raw, training_means, training_sds)
+  test_x <- standardize_with_training(test_x_raw, training_means, training_sds)
+  train_y <- as.integer(train_data$long_stay)
+
+  logistic_fit <- suppressWarnings(
+    glm.fit(
+      x = cbind(intercept = 1, train_x),
+      y = train_y,
+      family = binomial()
+    )
+  )
+  logistic_coefficients <- coef(logistic_fit)
+  logistic_coefficients[is.na(logistic_coefficients)] <- 0
+  logistic_probability <- as.numeric(
+    plogis(cbind(intercept = 1, test_x) %*% logistic_coefficients)
+  )
+
+  set.seed(seed + 1000)
+  neural_fit <- nnet::nnet(
+    x = train_x,
+    y = train_y,
+    size = 4,
+    decay = 0.01,
+    maxit = 500,
+    entropy = TRUE,
+    trace = FALSE,
+    MaxNWts = 10000
+  )
+  neural_probability <- as.numeric(
+    predict(neural_fit, test_x, type = "raw")
+  )
+
+  bind_rows(
+    calculate_classification_metrics(
+      test_data$long_stay,
+      logistic_probability,
+      "Logistic regression baseline",
+      seed
+    ),
+    calculate_classification_metrics(
+      test_data$long_stay,
+      neural_probability,
+      "Neural network",
+      seed
+    )
+  )
+}
+
+nn_seeds <- c(1101, 2202, 3303)
+nn_repeated_results <- map_dfr(nn_seeds, fit_prediction_models)
+
+format_mean_sd <- function(mean_value, sd_value) {
+  paste0(sprintf("%.3f", mean_value), " (", sprintf("%.3f", sd_value), ")")
+}
+
+nn_metric_summary <- nn_repeated_results %>%
+  group_by(model) %>%
+  summarize(
+    test_records = mean(test_records),
+    long_stay_rate = mean(long_stay_rate),
+    across(
+      c(accuracy, sensitivity, specificity, precision, auc, log_loss, brier_score),
+      list(mean = mean, sd = sd),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+nn_summary_table <- nn_metric_summary %>%
+  transmute(
+    model,
+    average_test_records = round(test_records),
+    average_long_stay_rate = percent(long_stay_rate, accuracy = 0.1),
+    accuracy = format_mean_sd(accuracy_mean, accuracy_sd),
+    sensitivity = format_mean_sd(sensitivity_mean, sensitivity_sd),
+    specificity = format_mean_sd(specificity_mean, specificity_sd),
+    auc = format_mean_sd(auc_mean, auc_sd),
+    brier_score = format_mean_sd(brier_score_mean, brier_score_sd)
+  )
+
+kable(
+  nn_summary_table,
+  caption = "Held-out long adoption-time prediction performance across three repeated splits"
+)
+
+nn_plot_data <- nn_repeated_results %>%
+  select(seed, model, accuracy, sensitivity, specificity, auc) %>%
+  pivot_longer(
+    cols = c(accuracy, sensitivity, specificity, auc),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(model, metric) %>%
+  summarize(
+    mean_value = mean(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      accuracy = "Accuracy",
+      sensitivity = "Sensitivity",
+      specificity = "Specificity",
+      auc = "AUC"
+    )
+  )
+
+p_nn_performance <- ggplot(nn_plot_data, aes(x = model, y = mean_value, fill = model)) +
+  geom_col(width = 0.62, alpha = 0.9) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_value - sd_value), ymax = pmin(1, mean_value + sd_value)),
+    width = 0.18,
+    linewidth = 0.55
+  ) +
+  facet_wrap(~ metric) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Held-out prediction performance for long adoption times",
+    subtitle = "Metrics are averaged across three stratified train-test splits.",
+    x = NULL,
+    y = "Metric value",
+    fill = "Model"
+  ) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+print(p_nn_performance)
+
+primary_split <- create_prediction_split(nn_model_data, nn_seeds[1])
+primary_train <- primary_split$train
+
+primary_train_x_raw <- build_design_matrix(primary_train)
+primary_training_means <- colMeans(primary_train_x_raw)
+primary_training_sds <- apply(primary_train_x_raw, 2, sd)
+primary_training_sds[is.na(primary_training_sds) | primary_training_sds == 0] <- 1
+primary_train_x <- standardize_with_training(
+  primary_train_x_raw,
+  primary_training_means,
+  primary_training_sds
+)
+
+set.seed(nn_seeds[1] + 1000)
+primary_neural_fit <- nnet::nnet(
+  x = primary_train_x,
+  y = as.integer(primary_train$long_stay),
+  size = 4,
+  decay = 0.01,
+  maxit = 500,
+  entropy = TRUE,
+  trace = FALSE,
+  MaxNWts = 10000
+)
+
+nn_age_grid <- expand_grid(
+  region = levels(age_model_data$region),
+  age_years = seq(0, min(15, max(age_model_data$age_years, na.rm = TRUE)), by = 0.1)
+) %>%
+  mutate(
+    age_group = make_age_group(age_years),
+    sex_group = reference_values$sex_group,
+    fixed_status = reference_values$fixed_status,
+    breed_family = reference_values$breed_family,
+    color_family = reference_values$color_family,
+    intake_month = reference_values$intake_month
+  ) %>%
+  cast_model_factor_levels()
+
+nn_age_x_raw <- align_design_matrix(
+  build_design_matrix(nn_age_grid),
+  colnames(primary_train_x_raw)
+)
+nn_age_x <- standardize_with_training(
+  nn_age_x_raw,
+  primary_training_means,
+  primary_training_sds
+)
+
+nn_age_predictions <- nn_age_grid %>%
+  mutate(
+    predicted_long_stay_risk = as.numeric(
+      predict(primary_neural_fit, nn_age_x, type = "raw")
+    )
+  )
+
+p_nn_age_risk <- ggplot(nn_age_predictions, aes(x = age_years, y = predicted_long_stay_risk, color = region)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Neural network predicted risk of long adoption time by age",
+    subtitle = "A long adoption time is defined as more than 30 days; other characteristics are held at common values.",
+    x = "Age in years",
+    y = "Predicted probability of long stay",
+    color = "Region"
+  )
+print(p_nn_age_risk)
+
+nn_auc_value <- nn_metric_summary %>%
+  filter(model == "Neural network") %>%
+  pull(auc_mean)
+
+glm_auc_value <- nn_metric_summary %>%
+  filter(model == "Logistic regression baseline") %>%
+  pull(auc_mean)
+
+nn_auc_difference <- nn_auc_value - glm_auc_value
+
+nn_comparison_sentence <- case_when(
+  nn_auc_difference > 0.02 ~
+    "The neural network provides a modest improvement in discrimination, which suggests that nonlinear patterns or interactions add some predictive value.",
+  nn_auc_difference < -0.02 ~
+    "The neural network does not improve discrimination over the simpler baseline, so the regression model remains preferable for interpretation.",
+  TRUE ~
+    "The two models have similar discrimination, so the neural network does not substantially change the main interpretation."
+)
+
+cat(
+  "\nNeural network average AUC:", round(nn_auc_value, 3),
+  "| Logistic baseline average AUC:", round(glm_auc_value, 3), "\n",
+  nn_comparison_sentence, "\n"
+)
+
+# -----------------------------------------------------------------------
+# 11. MODEL DIAGNOSTICS
+# -----------------------------------------------------------------------
+
+diagnostic_data <- augment(age_control_lm) %>%
+  mutate(
+    fitted_days = pmax(0, expm1(.fitted)),
+    residual = .resid
+  )
+
+p_resid_fitted <- ggplot(diagnostic_data, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.2, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Residuals vs fitted values for the final structured model",
+    x = "Fitted log(1 + days to adoption)",
+    y = "Residual"
+  )
+print(p_resid_fitted)
+
+p_qq <- ggplot(diagnostic_data, aes(sample = .std.resid)) +
+  stat_qq(alpha = 0.25) +
+  stat_qq_line(color = "#D55E00", linewidth = 1) +
+  labs(
+    title = "Q-Q plot for final structured model residuals",
+    x = "Theoretical quantiles",
+    y = "Standardized residuals"
+  )
+print(p_qq)
+
+cat("\nScript finished running successfully.\n")
