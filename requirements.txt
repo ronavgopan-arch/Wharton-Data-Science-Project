@@ -1,5 +1,6 @@
-booktabs
-longtable
-array
-float
-caption
+tidyverse
+lubridate
+scales
+knitr
+broom
+nnet
