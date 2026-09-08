@@ -1,0 +1,29 @@
+How Dog Traits and Region Affect Time to Adoption in Shelters
+
+Public animal shelter records from Austin (TX), Norfolk (VA), and Sonoma County (CA)
+
+Anya, Jack, Mason, Isha, Ronav — Wharton Global Youth Data Science Academy, July 2026
+
+Data Sources
+Source	Region	URL
+City of Austin Open Data Portal — Austin Animal Center Outcomes	Austin, TX	https://data.austintexas.gov/Health-and-Community-Services/Austin-Animal-Center-Outcomes/gsvs-ypi7
+City of Norfolk Open Data Portal — Norfolk Animal Care and Adoption Center (NACC)	Norfolk, VA	https://data.norfolk.gov/Government/Norfolk-Animal-Care-and-Adoption-Center-NACC-/vfm4-5wv6
+County of Sonoma Open Data Portal — Animal Shelter Intake and Outcome	Sonoma County, CA	https://data.sonomacounty.ca.gov/Government/Animal-Shelter-Intake-and-Outcome/924a-vesw
+
+Files used were dated June 30, 2026 (Austin), July 1, 2026 (Norfolk), and July 9, 2026 (Sonoma). Since these are live open-data portals, re-downloading today may return a larger or updated set of records than the snapshot used in this analysis.
+
+Summary
+
+This project investigates which traits of shelter dogs — age, breed, region, size, color, and sex — are associated with faster adoption, and whether those traits can be used to predict how long a dog will stay in a shelter before being adopted. Understanding these patterns matters practically: shelters operate with limited staff and marketing budgets, and identifying "low-appeal" or "at-risk" dogs early lets staff direct extra resources (marketing, foster placement) toward the animals least likely to be adopted quickly, which can help raise adoption rates and reduce negative outcomes such as euthanasia.
+
+The team pulled 106,786 raw animal intake/outcome records from three municipal open-data portals, restricted the analysis to a shared 12-month outcome window (May 5, 2025 – April 5, 2026), and narrowed the dataset to adopted dogs with known sex and spay/neuter status. After cleaning, harmonizing breeds into 7 families and colors into 8 groups, and computing stay length as outcome date minus intake date, the final modeling sample contained 2,884 adopted dogs (2,071 Austin, 486 Norfolk, 327 Sonoma).
+
+The team then ran exploratory analysis, a linear regression on log(stay days + 1), an ANOVA to rank which traits mattered most, and three predictive models (logistic regression baseline, neural network, and a categorical-aware random forest) to test both exact-day prediction and prediction of adoption within fixed time windows (30/60/90/180 days).
+
+Key Insights
+
+Age and breed family emerged as the two strongest, most statistically robust predictors of adoption speed, with breed family explaining the largest share of variance in the ANOVA (partial η² = 0.088, p = 6.68e-54) followed by age group (η² = 0.057, p = 3.62e-36); puppies were adopted fastest across every region studied, while small companion breeds saw roughly 65% shorter stays and Pit Bull/Staffy-type dogs saw roughly 26% longer stays than the Retriever reference group. Region and the region-by-age interaction were also statistically significant (median stay length: 29 days in Austin, 46.5 in Norfolk, 41 in Sonoma), indicating that age effects on adoption speed are not uniform across shelters — notably, Norfolk showed a distinct interaction where puppies did not benefit from the same speed advantage seen elsewhere. By contrast, sex and color family showed no statistically detectable relationship with adoption speed once other traits were controlled for. On the predictive-modeling side, all three models (logistic regression, neural network, random forest) struggled to predict a dog's exact number of days to adoption (mean absolute error near 50 days), but performed well at predicting the probability a dog would be adopted within a given time window (30/60/90/180 days), with the random forest's predicted probabilities closely tracking observed adoption rates across every age group — suggesting shelters are better served by interval-based forecasting (e.g., "70% chance of adoption within 90 days") than by attempts at precise day-count predictions.
+
+Limitations
+
+This analysis is based on observational administrative shelter records, so all relationships identified are associations rather than confirmed causal effects. The dataset excludes dogs that were transferred, euthanized, returned to owner, or died in care, since these outcomes lack the reasoning/context needed to interpret them consistently across shelters — meaning the findings describe adoption timing only among the subset of dogs who were successfully adopted, not the full population of shelter intakes. The three source portals also differ in how they record age (exact date of birth for Austin and Sonoma vs. years-and-months for Norfolk), which required harmonization and may introduce small measurement inconsistencies. Additionally, the data does not include health status, temperament/behavior notes, foster availability, shelter capacity, or marketing effort — all plausible drivers of adoption speed that could not be tested here. Finally, residual variance in the regression remained large even after accounting for all measured traits, meaning a meaningful share of what determines an individual dog's exact adoption timeline is not explained by any variable available in this dataset. Suggested directions for future research include incorporating health and behavior data, comparing outcomes across differing shelter marketing/euthanasia policies, and examining the effect of adoption fees.
